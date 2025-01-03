@@ -1,0 +1,3 @@
+aiogram
+ton-sdk
+python-dotenv
