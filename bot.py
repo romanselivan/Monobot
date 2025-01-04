@@ -1,6 +1,5 @@
 import os
 import asyncio
-import logging
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
@@ -10,8 +9,9 @@ from datetime import datetime, timedelta
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
+import logging
 
-# Set up logging
+# Logger setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -28,122 +28,185 @@ dp = Dispatcher()
 
 # Initialize database
 def init_db():
-    with sqlite3.connect('messages.db') as conn:
-        conn.execute('''CREATE TABLE IF NOT EXISTS messages (
-                        user_id INTEGER, 
-                        username TEXT, 
-                        chat_id INTEGER, 
-                        chat_title TEXT, 
-                        message_count INTEGER,
-                        PRIMARY KEY (user_id, chat_id))''')
+    try:
+        with sqlite3.connect('messages.db') as conn:
+            # Create table if not exists
+            conn.execute('''CREATE TABLE IF NOT EXISTS messages (
+                            user_id INTEGER, 
+                            username TEXT, 
+                            chat_id INTEGER, 
+                            chat_title TEXT, 
+                            message_count INTEGER,
+                            PRIMARY KEY (user_id, chat_id))''')
+            
+            # Add missing columns if they don't exist
+            conn.execute('''PRAGMA foreign_keys=OFF;''')  # Disable foreign key check
+            conn.execute('''PRAGMA cache_size=10000;''')  # Increase cache size for the speed of ALTER operations
+            
+            # Check and add missing columns if necessary
+            columns = conn.execute("PRAGMA table_info(messages);").fetchall()
+            column_names = [column[1] for column in columns]
+
+            if 'chat_id' not in column_names:
+                conn.execute('ALTER TABLE messages ADD COLUMN chat_id INTEGER;')
+            if 'chat_title' not in column_names:
+                conn.execute('ALTER TABLE messages ADD COLUMN chat_title TEXT;')
+
+            conn.execute('''PRAGMA foreign_keys=ON;''')  # Re-enable foreign key check
+    except Exception as e:
+        logger.error(f"Error initializing database: {e}")
+
 init_db()
 
 # Google Sheets setup
 scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-client = None
 try:
     creds = ServiceAccountCredentials.from_json_keyfile_dict(G_SHEET_KEY, scope)
     client = gspread.authorize(creds)
 except Exception as e:
+    client = None
     logger.error(f"Failed to initialize Google Sheets client: {e}")
 
 async def periodic_save():
     while True:
-        try:
-            await asyncio.sleep(300)  # Save every 5 minutes
-            with sqlite3.connect('messages.db') as conn:
-                conn.commit()
-        except Exception as e:
-            logger.error(f"Error during periodic save: {e}")
+        await asyncio.sleep(300)  # Save every 5 minutes
+        with sqlite3.connect('messages.db') as conn:
+            conn.commit()
 
 @dp.message(Command('count'))
 async def count_messages(message: types.Message):
+    if message.from_user.id != ADMIN_USER_ID:
+        await message.reply("Access denied.")
+        return
+
+    with sqlite3.connect('messages.db') as conn:
+        cursor = conn.execute('''
+            SELECT chat_title, COUNT(DISTINCT user_id) as user_count, SUM(message_count) as total_messages
+            FROM messages
+            GROUP BY chat_id
+            ORDER BY total_messages DESC
+        ''')
+        chat_stats = cursor.fetchall()
+
+    if not chat_stats:
+        await message.reply("No data available.")
+        return
+
+    report = "Group statistics:\n\n"
+    for chat_title, user_count, total_messages in chat_stats:
+        report += f"Group: {chat_title}\nUsers: {user_count}\nMessages: {total_messages}\n\n"
+    await message.reply(report)
+
+@dp.message(Command('mystats'))
+async def my_stats(message: types.Message):
+    user_id = message.from_user.id
+    username = message.from_user.username or "Unknown"
+
+    with sqlite3.connect('messages.db') as conn:
+        cursor = conn.execute('''
+            SELECT chat_title, message_count
+            FROM messages
+            WHERE user_id = ?
+            ORDER BY message_count DESC
+        ''', (user_id,))
+        user_stats = cursor.fetchall()
+
+    if not user_stats:
+        await message.reply("You have no statistics yet.")
+        return
+
+    report = f"Your statistics, @{username}:\n\n"
+    for chat_title, message_count in user_stats:
+        report += f"Group: {chat_title}\nMessages: {message_count}\n\n"
+    await message.reply(report)
+
+@dp.message(Command('import'))
+async def import_to_sheets(message: types.Message):
+    if message.from_user.id != ADMIN_USER_ID:
+        await message.reply("Access denied.")
+        return
+
+    if not client:
+        await message.reply("Google Sheets integration is not configured.")
+        return
+
+    await message.reply("Exporting data to Google Sheets...")
+
     try:
-        if message.from_user.id != ADMIN_USER_ID:
-            await message.reply("Access denied.")
-            return
+        sheet = client.open('TelegramBotStats').sheet1
 
         with sqlite3.connect('messages.db') as conn:
-            cursor = conn.execute('''
-                SELECT chat_title, COUNT(DISTINCT user_id) as user_count, SUM(message_count) as total_messages
-                FROM messages
-                GROUP BY chat_id
-                ORDER BY total_messages DESC
-            ''')
-            chat_stats = cursor.fetchall()
+            cursor = conn.execute('SELECT DISTINCT chat_id, chat_title FROM messages')
+            chats = cursor.fetchall()
 
-        if not chat_stats:
-            await message.reply("No data available.")
-            return
+            for chat_id, chat_title in chats:
+                try:
+                    worksheet = sheet.worksheet(chat_title)
+                except gspread.WorksheetNotFound:
+                    worksheet = sheet.add_worksheet(title=chat_title, rows="1000", cols="20")
 
-        report = "Group statistics:\n\n"
-        for chat_title, user_count, total_messages in chat_stats:
-            report += f"Group: {chat_title}\nUsers: {user_count}\nMessages: {total_messages}\n\n"
-        await message.reply(report)
+                headers = ['User ID', 'Username', 'Message Count', 'Last Updated']
+                worksheet.update('A1:D1', [headers])
 
+                cursor = conn.execute('''
+                    SELECT user_id, username, message_count
+                    FROM messages
+                    WHERE chat_id = ?
+                    ORDER BY message_count DESC
+                ''', (chat_id,))
+                data = cursor.fetchall()
+
+                current_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                data_with_date = [list(row) + [current_date] for row in data]
+
+                worksheet.update('A2', data_with_date)
+
+        await message.reply("Data exported successfully.")
     except Exception as e:
-        logger.error(f"Error in /count command: {e}")
-        await message.reply("An error occurred while processing your request.")
-
-@dp.message(Command('start'))
-async def start(message: types.Message):
-    try:
-        text = (
-            "I help my friends exchange one thing for another. Here are some commands you can use:\n"
-            "/count - View the stats of all groups\n"
-            "/mystats - View your personal stats\n"
-            "/import - Export data to Google Sheets"
-        )
-        await message.reply(text)
-    except Exception as e:
-        logger.error(f"Error in /start command: {e}")
-        await message.reply("An error occurred while processing your request.")
+        await message.reply(f"Error during export: {e}")
 
 @dp.message()
 async def count_message(message: types.Message):
-    try:
-        user_id = message.from_user.id
-        username = message.from_user.username or "Unknown"
-        chat_id = message.chat.id
-        chat_title = message.chat.title or "Unknown"
+    user_id = message.from_user.id
+    username = message.from_user.username or "Unknown"
+    chat_id = message.chat.id
+    chat_title = message.chat.title or "Unknown"
 
-        with sqlite3.connect('messages.db') as conn:
-            conn.execute('''
-                INSERT OR REPLACE INTO messages (user_id, username, chat_id, chat_title, message_count)
-                VALUES (?, ?, ?, ?, COALESCE((SELECT message_count FROM messages WHERE user_id = ? AND chat_id = ?), 0) + 1)
-            ''', (user_id, username, chat_id, chat_title, user_id, chat_id))
+    with sqlite3.connect('messages.db') as conn:
+        conn.execute('''
+            INSERT OR REPLACE INTO messages (user_id, username, chat_id, chat_title, message_count)
+            VALUES (?, ?, ?, ?, COALESCE((SELECT message_count FROM messages WHERE user_id = ? AND chat_id = ?), 0) + 1)
+        ''', (user_id, username, chat_id, chat_title, user_id, chat_id))
 
-    except Exception as e:
-        logger.error(f"Error in message counting: {e}")
+@dp.message(Command('start'))
+async def start_command(message: types.Message):
+    text = (
+        "I can help you with the following commands:\n"
+        "/count - Get statistics for all groups.\n"
+        "/mystats - View your personal statistics.\n"
+        "/import - Export data to Google Sheets.\n"
+        "Simply type a message, and I will count it for you!"
+    )
+    await message.reply(text)
 
 async def on_startup(bot: Bot):
-    try:
-        await bot.set_webhook(WEBHOOK_URL)
-        asyncio.create_task(periodic_save())
-    except Exception as e:
-        logger.error(f"Error during startup: {e}")
+    await bot.set_webhook(WEBHOOK_URL)
+    asyncio.create_task(periodic_save())
 
 async def on_shutdown(bot: Bot):
-    try:
-        await bot.delete_webhook()
-    except Exception as e:
-        logger.error(f"Error during shutdown: {e}")
+    await bot.delete_webhook()
 
 # Main application setup
 def main():
-    try:
-        app = web.Application()
-        SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
-        setup_application(app, dp, bot=bot)
+    app = web.Application()
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, bot=bot)
 
-        app.on_startup.append(lambda app: asyncio.create_task(on_startup(bot)))
-        app.on_shutdown.append(lambda app: asyncio.create_task(on_shutdown(bot)))
+    app.on_startup.append(lambda app: asyncio.create_task(on_startup(bot)))
+    app.on_shutdown.append(lambda app: asyncio.create_task(on_shutdown(bot)))
 
-        port = int(os.getenv('PORT', 10000))
-        web.run_app(app, host='0.0.0.0', port=port)
-
-    except Exception as e:
-        logger.error(f"Error during main execution: {e}")
+    port = int(os.getenv('PORT', 10000))
+    web.run_app(app, host='0.0.0.0', port=port)
 
 if __name__ == '__main__':
     main()
