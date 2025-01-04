@@ -8,9 +8,8 @@ import sqlite3
 
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID'))
-WEBHOOK_HOST = os.getenv('WEBHOOK_HOST')
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
-WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+WEBHOOK_URL = os.getenv('RENDER_EXTERNAL_URL', '') + WEBHOOK_PATH
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -57,7 +56,9 @@ def main():
     webhook_requests_handler.register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
     app.on_startup.append(on_startup)
-    web.run_app(app, host="0.0.0.0", port=8080)
+    
+    port = int(os.getenv('PORT', 10000))
+    web.run_app(app, host='0.0.0.0', port=port)
 
 if __name__ == '__main__':
     main()
