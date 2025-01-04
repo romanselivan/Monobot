@@ -44,8 +44,11 @@ async def count_message(message: types.Message):
                    (user_id, username, user_id))
     conn.commit()
 
-async def on_startup(bot: Bot) -> None:
+async def on_startup(bot: Bot):
     await bot.set_webhook(WEBHOOK_URL)
+
+async def on_shutdown(bot: Bot):
+    await bot.delete_webhook()
 
 def main():
     app = web.Application()
@@ -55,7 +58,9 @@ def main():
     )
     webhook_requests_handler.register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
-    app.on_startup.append(on_startup)
+    
+    app.on_startup.append(lambda app: asyncio.create_task(on_startup(bot)))
+    app.on_shutdown.append(lambda app: asyncio.create_task(on_shutdown(bot)))
     
     port = int(os.getenv('PORT', 10000))
     web.run_app(app, host='0.0.0.0', port=port)
