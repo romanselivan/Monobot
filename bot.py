@@ -9,7 +9,6 @@ from datetime import datetime, timedelta
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import json
-from aiocron import crontab
 
 # Загрузка конфигурации из переменных окружения
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -46,8 +45,10 @@ async def periodic_save():
         last_save_time = datetime.now()
 
 async def keep_alive():
-    # Здесь можно добавить любую логику для "пробуждения" сервиса
-    print("Keeping the service alive")
+    while True:
+        await asyncio.sleep(840)  # 14 минут
+        print("Keeping the service alive")
+        # Здесь можно добавить любую логику для "пробуждения" сервиса
 
 @dp.message(Command('count'))
 async def count_messages(message: types.Message):
@@ -155,7 +156,7 @@ async def count_message(message: types.Message):
 async def on_startup(bot: Bot):
     await bot.set_webhook(WEBHOOK_URL)
     asyncio.create_task(periodic_save())
-    crontab('*/14 * * * *', func=keep_alive, start=True)
+    asyncio.create_task(keep_alive())
 
 async def on_shutdown(bot: Bot):
     await bot.delete_webhook()
